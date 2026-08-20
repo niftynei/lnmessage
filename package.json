@@ -13,7 +13,6 @@
   "repository": "github:aaronbarnardsound/lnmessage",
   "scripts": {
     "build": "tsc",
-    "prepare": "npm run build",
     "test": "npm run build && node --test test/*.test.mjs"
   },
   "devDependencies": {

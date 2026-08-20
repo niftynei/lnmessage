@@ -190,3 +190,18 @@ export type Logger = {
 }
 
 export type ConnectionStatus = 'connected' | 'connecting' | 'disconnected' | 'waiting_reconnect' | 'failed'
+
+export type LnMessageErrorCode = 'decrypt_failure' | 'protocol_failure'
+
+/** A fatal transport/protocol error that terminates the current session. */
+export class LnMessageError extends Error {
+  public readonly code: LnMessageErrorCode
+  public readonly cause?: unknown
+
+  constructor(code: LnMessageErrorCode, message: string, cause?: unknown) {
+    super(message)
+    this.name = 'LnMessageError'
+    this.code = code
+    this.cause = cause
+  }
+}

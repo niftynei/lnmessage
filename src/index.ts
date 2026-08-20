@@ -24,7 +24,8 @@ import {
   JsonRpcErrorResponse,
   Logger,
   CommandoRequest,
-  ConnectionStatus
+  ConnectionStatus,
+  LnMessageError
 } from './types.js'
 
 const DEFAULT_RECONNECT_ATTEMPTS = 5
@@ -61,6 +62,8 @@ class LnMessage {
    * Can be either 'connected', 'connecting', 'waiting_reconnect', 'disconnected' or 'failed'.
    */
   public connectionStatus$: BehaviorSubject<ConnectionStatus>
+  /** Fatal transport/protocol errors for the current session. */
+  public connectionErrors$: Observable<LnMessageError>
   /**
    * @deprecated Use connectionStatus$ instead
    */
@@ -82,6 +85,7 @@ class LnMessage {
   private _readState: READ_STATE
   private _decryptedMsgs$: Subject<Buffer>
   private _commandoMsgs$: Subject<CommandoMessage>
+  private _connectionErrors$: Subject<LnMessageError>
   private _partialCommandoMsgs: Record<string, Buffer>
   private _attemptedReconnects: number
   private _logger: Logger | void
@@ -128,6 +132,8 @@ class LnMessage {
     this._decryptedMsgs$ = new Subject()
     this.decryptedMsgs$ = this._decryptedMsgs$.asObservable()
     this._commandoMsgs$ = new Subject()
+    this._connectionErrors$ = new Subject()
+    this.connectionErrors$ = this._connectionErrors$.asObservable()
     this.commandoMsgs$ = this._commandoMsgs$
       .asObservable()
       .pipe(map(({ response, id }) => ({ ...response, reqId: id })))
@@ -322,8 +328,7 @@ class LnMessage {
       // Terminate on failures as we won't be able to recover
       // since the noise state has rotated nonce and we won't
       // be able to any more data without additional errors.
-      this._log('error', `Noise state has rotated nonce: ${err}`)
-      this.disconnect()
+      this._handleProtocolFailure(err)
     }
 
     this._processingBuffer = false
@@ -366,11 +371,18 @@ class LnMessage {
       // Try to read the length cipher bytes and the length MAC bytes
       // If we cannot read the 18 bytes, the attempt to process the
       // message will abort.
-      const lc = this._messageBuffer.readBytes(LEN_CIPHER_BYTES + LEN_MAC_BYTES)
-      if (!lc) return false
+      const lc = this._messageBuffer.peakBytes(LEN_CIPHER_BYTES + LEN_MAC_BYTES)
 
       // Decrypt the length including the MAC
-      const l = this.noise.decryptLength(lc)
+      let l: number
+
+      try {
+        l = this.noise.decryptLength(lc)
+      } catch (error) {
+        throw new LnMessageError('decrypt_failure', 'Failed to decrypt the Lightning message length', error)
+      }
+
+      this._messageBuffer.readBytes(LEN_CIPHER_BYTES + LEN_MAC_BYTES)
 
       // We need to store the value in a local variable in case
       // we are unable to read the message body in its entirety.
@@ -384,6 +396,7 @@ class LnMessage {
       // return true to continue reading
       return true
     } catch (err) {
+      if (err instanceof LnMessageError) throw err
       return false
     }
   }
@@ -399,11 +412,18 @@ class LnMessage {
       // there is not enough data in the read buffer, we need to
       // store l. We are not able to simply unshift it becuase we
       // have already rotated the keys.
-      const c = this._messageBuffer.readBytes(this._l + MESSAGE_MAC_BYTES)
-      if (!c) return false
+      const c = this._messageBuffer.peakBytes(this._l + MESSAGE_MAC_BYTES)
 
       // Decrypt the full message cipher + MAC
-      const m = this.noise.decryptMessage(c)
+      let m: Buffer
+
+      try {
+        m = this.noise.decryptMessage(c)
+      } catch (error) {
+        throw new LnMessageError('decrypt_failure', 'Failed to decrypt the Lightning message body', error)
+      }
+
+      this._messageBuffer.readBytes(this._l + MESSAGE_MAC_BYTES)
 
       // Now that we've read the message, we can remove the
       // cached length before we transition states
@@ -417,6 +437,7 @@ class LnMessage {
 
       return true
     } catch (err) {
+      if (err instanceof LnMessageError) throw err
       return false
     }
   }
@@ -605,6 +626,21 @@ class LnMessage {
       this._logger[level](`[${level.toUpperCase()} - ${new Date().toISOString()}]: ${msg}`)
     }
   }
+
+  private _handleProtocolFailure(error: unknown) {
+    const failure =
+      error instanceof LnMessageError
+        ? error
+        : new LnMessageError('protocol_failure', 'Fatal Lightning transport error', error)
+
+    this._log('error', `${failure.code}: ${failure.message}`)
+    this._connectionErrors$.next(failure)
+
+    // Manual disconnect() disables reconnect before closing. Protocol
+    // failures preserve the configured automatic reconnect behavior.
+    this._close()
+  }
 }
 
+export { LnMessageError }
 export default LnMessage
